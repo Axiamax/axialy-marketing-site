@@ -1,76 +1,96 @@
-name: Full Deploy
+name: CI ▶️ DigitalOcean
 
 on:
   push:
     branches: [ main ]
 
-env:
-  NAMESILO_DOMAIN: axialy.ai
-
 jobs:
-  provision:
-    runs-on: ubuntu-latest
-    outputs:
-      droplet_ip: ${{ steps.output_ip.outputs.droplet_ip }}
-
-    steps:
-      - name: Checkout repo
-        uses: actions/checkout@v3
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: 1.5.0
-          terraform_wrapper: false
-
-      - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
-
-      - name: Terraform Apply
-        working-directory: terraform
-        run: |
-          terraform apply -auto-approve \
-            -var "do_token=${{ secrets.DO_TOKEN }}" \
-            -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
-
-      - name: Capture Droplet IP
-        id: output_ip
-        working-directory: terraform
-        run: |
-          IP=$(terraform output -raw droplet_ip)
-          echo "droplet_ip=$IP" >> $GITHUB_OUTPUT
-
   deploy:
-    needs: provision
     runs-on: ubuntu-latest
+    env:
+      DO_TOKEN: ${{ secrets.DO_TOKEN     }} # Personal Access Token with write rights
+      SSH_KEY:  ${{ secrets.SSH_PUBLIC    }} # The public half of your deploy key
+      SSH_PRIV: ${{ secrets.SSH_PRIVATE   }} # The private half, optional if you use DO’s “apps” feature
+      SSH_PASS: ${{ secrets.SSH_PASSPHRASE }} # If your private key is passphrase-protected
+      DROPLET:  axialy-main
+      REGION:   nyc3
+      IMAGE:    ubuntu-24-04-x64
+      SIZE:     s-1vcpu-1gb
 
     steps:
-      - name: Checkout repo
+      - name: Check out code
         uses: actions/checkout@v3
 
-      - name: Wait for SSH
+      - name: Install doctl
         run: |
-          echo "🔄 Waiting for SSH to be ready on ${{ needs.provision.outputs.droplet_ip }}…"
+          curl -sL https://github.com/digitalocean/doctl/releases/latest/download/doctl-$(uname)-amd64.tar.gz \
+            | tar -xzC /usr/local/bin doctl
+          doctl version
+
+      - name: Authenticate doctl
+        run: doctl auth init --access-token $DO_TOKEN
+
+      - name: Ensure SSH key is registered
+        id: sshkey
+        run: |
+          # Try to find it by fingerprint; if not found, add it:
+          FINGERPRINT=$(ssh-keygen -lf <(echo "$SSH_KEY") | awk '{print $2}')
+          if doctl compute ssh-key list --format Name,Fingerprint \
+              | grep -q "$FINGERPRINT"; then
+            echo "Key already registered."
+          else
+            echo "Registering new key…"
+            doctl compute ssh-key create \
+              --public-key "$SSH_KEY" \
+              --name "deploy-key-${{ github.run_id }}"
+          fi
+
+      - name: Check for existing Droplet
+        id: droplet-check
+        run: |
+          if doctl compute droplet list --format Name --no-header \
+              | grep -xq "$DROPLET"; then
+            echo "::set-output name=exists::yes"
+          else
+            echo "::set-output name=exists::no"
+          fi
+
+      - name: Create Droplet if missing
+        if: steps.droplet-check.outputs.exists == 'no'
+        run: |
+          # grab all your key IDs so the new Droplet can ssh in later
+          KEY_IDS=$(doctl compute ssh-key list --format ID --no-header | paste -sd, -)
+          doctl compute droplet create $DROPLET \
+            --region $REGION \
+            --image  $IMAGE \
+            --size   $SIZE \
+            --ssh-keys $KEY_IDS \
+            --wait
+          echo "Droplet created."
+
+      - name: Get Droplet IP
+        id: get-ip
+        run: |
+          IP=$(doctl compute droplet list \
+            --format Name,PublicIPv4 --no-header \
+            | awk -v name="$DROPLET" '$1==name {print $2}')
+          echo "::set-output name=ip::$IP"
+
+      - name: Wait for SSH to be ready
+        run: |
           for i in {1..12}; do
-            if nc -z ${{ needs.provision.outputs.droplet_ip }} 22; then
-              echo "✅ SSH is up!"
-              break
-            fi
-            echo "…retry in 5s"
+            nc -zv ${{ steps.get-ip.outputs.ip }} 22 && break
             sleep 5
           done
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v0.1.7
         with:
-          host: ${{ needs.provision.outputs.droplet_ip }}
+          host: ${{ steps.get-ip.outputs.ip }}
           username: root
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          key: ${{ secrets.SSH_PRIVATE }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
-            apt-get update && apt-get install -y git
-            mkdir -p /var/www/html
             cd /var/www/html
             if [ -d .git ]; then
               git pull
@@ -78,22 +98,3 @@ jobs:
               git clone https://github.com/${{ github.repository }} .
             fi
 
-      - name: Setup Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.x'
-
-      - name: Install DNS script deps
-        run: pip install requests xmltodict
-
-      - name: Debug DNS inputs
-        run: |
-          echo "⟳ NAMESILO_DOMAIN=${NAMESILO_DOMAIN}"
-          echo "⟳ TARGET_IP=${{ needs.provision.outputs.droplet_ip }}"
-
-      - name: Update DNS records
-        run: |
-          python scripts/update-dns.py \
-            --api-key "${{ secrets.NAMESILO_API_KEY }}" \
-            --domain "${{ env.NAMESILO_DOMAIN }}" \
-            --ip "${{ needs.provision.outputs.droplet_ip }}"
