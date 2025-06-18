@@ -5,6 +5,7 @@ on:
     branches: [ main ]
 
 env:
+  # your domain is not a secret
   NAMESILO_DOMAIN: axialy.ai
 
 jobs:
@@ -12,8 +13,10 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       droplet_ip: ${{ steps.output_ip.outputs.ip }}
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v2
@@ -26,9 +29,10 @@ jobs:
 
       - name: Terraform Apply
         working-directory: terraform
-        run: terraform apply -auto-approve \
-             -var "do_token=${{ secrets.DO_TOKEN }}" \
-             -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
+        run: |
+          terraform apply -auto-approve \
+            -var "do_token=${{ secrets.DO_TOKEN }}" \
+            -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
 
       - name: Capture Droplet IP
         id: output_ip
@@ -38,8 +42,10 @@ jobs:
   deploy:
     needs: provision
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v3
 
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v0.1.7
@@ -65,7 +71,8 @@ jobs:
         run: pip install requests xmltodict
 
       - name: Update DNS records
-        run: python scripts/update-dns.py \
-              --api-key "${{ secrets.NAMESILO_API_KEY }}" \
-              --domain "${{ env.NAMESILO_DOMAIN }}" \
-              --ip "${{ needs.provision.outputs.droplet_ip }}"
+        run: |
+          python scripts/update-dns.py \
+            --api-key "${{ secrets.NAMESILO_API_KEY }}" \
+            --domain "${{ env.NAMESILO_DOMAIN }}" \
+            --ip "${{ needs.provision.outputs.droplet_ip }}"
