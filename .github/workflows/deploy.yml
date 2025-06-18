@@ -1,0 +1,71 @@
+name: Full Deploy
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  NAMESILO_DOMAIN: axialy.ai
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    outputs:
+      droplet_ip: ${{ steps.output_ip.outputs.ip }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
+        with:
+          terraform_version: 1.5.0
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Apply
+        working-directory: terraform
+        run: terraform apply -auto-approve \
+             -var "do_token=${{ secrets.DO_TOKEN }}" \
+             -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
+
+      - name: Capture Droplet IP
+        id: output_ip
+        working-directory: terraform
+        run: echo "::set-output name=ip::$(terraform output -raw droplet_ip)"
+
+  deploy:
+    needs: provision
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v0.1.7
+        with:
+          host: ${{ needs.provision.outputs.droplet_ip }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            mkdir -p /var/www/html
+            cd /var/www/html
+            if [ -d .git ]; then
+              git pull
+            else
+              git clone https://github.com/${{ github.repository }} .
+            fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install DNS script deps
+        run: pip install requests xmltodict
+
+      - name: Update DNS records
+        run: python scripts/update-dns.py \
+              --api-key "${{ secrets.NAMESILO_API_KEY }}" \
+              --domain "${{ env.NAMESILO_DOMAIN }}" \
+              --ip "${{ needs.provision.outputs.droplet_ip }}"
