@@ -1,26 +1,17 @@
 #!/usr/bin/env python3
-import argparse
-import requests
-import xmltodict
+"""
+Synchronise NameSilo A‑record with the droplet IP produced by Terraform.
+Requires: requests, xmltodict
+"""
+import argparse, requests, xmltodict, sys
 
-API_BASE = "https://www.namesilo.com/api"
-
-def dns_list_records(api_key, domain):
-    r = requests.get(f"{API_BASE}/dnsListRecords", params={
-        "version": "1", "type": "xml", "key": api_key, "domain": domain
-    })
+def call(endpoint: str, params: dict):
+    r = requests.get(f"https://www.namesilo.com/api/{endpoint}", params=params, timeout=15)
     r.raise_for_status()
-    recs = xmltodict.parse(r.text)["namesilo"]["reply"]["resource_record_list"]["resource_record"]
-    return recs if isinstance(recs, list) else [recs]
-
-def dns_update_record(api_key, domain, rrid, host, ip, ttl=7207):
-    r = requests.get(f"{API_BASE}/dnsUpdateRecord", params={
-        "version": "1", "type": "xml", "key": api_key,
-        "domain": domain, "rrid": rrid, "rrhost": host,
-        "rrvalue": ip, "rrttl": ttl
-    })
-    r.raise_for_status()
-    return xmltodict.parse(r.text)
+    data = xmltodict.parse(r.text)
+    if data["namesilo"]["reply"]["code"] != '300':
+        raise RuntimeError(data["namesilo"]["reply"].get("detail", "Unknown API error"))
+    return data
 
 def main():
     p = argparse.ArgumentParser()
@@ -29,12 +20,36 @@ def main():
     p.add_argument("--ip", required=True)
     args = p.parse_args()
 
-    for rec in dns_list_records(args.api_key, args.domain):
-        host = rec["host"]
-        if host in ["@", "www"]:
-            print(f"Updating {host}.{args.domain} → {args.ip}")
-            dns_update_record(args.api_key, args.domain, rec["record_id"], host, args.ip)
-    print("DNS update complete.")
+    base = {"version": "1", "type": "xml", "key": args.api_key}
+    existing = call("dnsListRecords", {**base, "domain": args.domain})
+
+    records = existing["namesilo"]["reply"].get("resource_record", [])
+    if isinstance(records, dict):  # Only one record present
+        records = [records]
+
+    a_records = [r for r in records if r["type"] == "A" and r["host"].rstrip('.') == args.domain]
+
+    if a_records and a_records[0]["value"] == args.ip:
+        print("✅ DNS already up‑to‑date")
+        return
+
+    if a_records:
+        print("🔄 Removing stale A‑record…")
+        call("dnsDeleteRecord", {**base, "domain": args.domain, "rrid": a_records[0]["record_id"]})
+
+    print("➕ Adding new A‑record…")
+    call("dnsAddRecord", {
+        **base,
+        "domain": args.domain,
+        "rrtype": "A",
+        "rrhost": "@",
+        "rrvalue": args.ip,
+        "rrttl": "3600",
+    })
+    print("✅ DNS updated →", args.ip)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        sys.exit(f"❌ {e}")
