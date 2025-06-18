@@ -1,75 +1,116 @@
-name: Deploy
+name: Provision & Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NAMESILO_DOMAIN: axialy.ai
+  TF_VERSION: 1.6.6
+  DO_REGION: nyc3
+
 jobs:
-  deploy:
-    runs-on: ubuntu-24.04
+  terraform:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: terraform
+    outputs:
+      droplet_ip: ${{ steps.output_ip.outputs.droplet_ip }}
 
     steps:
-      - name: Check out code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v4
 
-      - name: Install doctl
-        run: |
-          curl -fsSL https://github.com/digitalocean/doctl/releases/latest/download/doctl-linux-amd64.tar.gz \
-            -o doctl.tar.gz
-          sudo tar -xzvf doctl.tar.gz -C /usr/local/bin doctl
-
-      - name: Authenticate doctl
-        env:
-          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
-        run: doctl auth init -t "$DIGITALOCEAN_TOKEN"
-
-      - name: Ensure SSH key is imported
-        env:
-          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
-          SSH_KEY_FINGERPRINT: ${{ secrets.SSH_KEY_FINGERPRINT }}
-        run: |
-          echo "$SSH_PUBLIC_KEY" > /tmp/deploy_key.pub
-          if ! doctl compute ssh-key list --format FingerPrint --no-header | grep -q "$SSH_KEY_FINGERPRINT"; then
-            doctl compute ssh-key import deploy_key \
-              --public-key-file /tmp/deploy_key.pub \
-              --fingerprint "$SSH_KEY_FINGERPRINT"
-          fi
-
-      - name: Ensure droplet exists
-        env:
-          SSH_KEY_FINGERPRINT: ${{ secrets.SSH_KEY_FINGERPRINT }}
-        run: |
-          NAME="axialy-main"
-          if ! doctl compute droplet list --format Name --no-header | grep -xq "$NAME"; then
-            doctl compute droplet create "$NAME" \
-              --region nyc3 \
-              --image ubuntu-24-04-x64 \
-              --size s-1vcpu-1gb \
-              --ssh-keys "$SSH_KEY_FINGERPRINT" \
-              --wait
-          fi
-
-      - name: Get droplet IP
-        id: get_ip
-        run: |
-          IP=$(doctl compute droplet list axialy-main \
-            --format PublicIPv4 --no-header | head -n1)
-          echo "ip=$IP" >> $GITHUB_OUTPUT
-
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v0.1.7
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v2
         with:
-          host: ${{ steps.get_ip.outputs.ip }}
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Init
+        run: terraform init -input=false
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -no-color \
+          -var "do_token=${{ secrets.DO_TOKEN }}" \
+          -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main'
+        run: terraform apply -auto-approve \
+          -var "do_token=${{ secrets.DO_TOKEN }}" \
+          -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
+
+      - name: Capture Droplet IP
+        id: output_ip
+        run: echo "droplet_ip=$(terraform output -raw droplet_ip)" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: terraform
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for SSH
+        run: |
+          ip=${{ needs.terraform.outputs.droplet_ip }}
+          echo "Waiting for $ip to be reachable..."
+          for i in {1..24}; do
+            if ssh -o StrictHostKeyChecking=no -i <(echo "${{ secrets.SSH_PRIVATE_KEY }}") root@$ip 'echo ok' &>/dev/null; then
+              echo "Droplet ready."
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Timed out waiting for droplet." && exit 1
+
+      - name: Deploy site over SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ needs.terraform.outputs.droplet_ip }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
-            apt-get update && apt-get install -y git
-            mkdir -p /var/www/html
-            cd /var/www/html
-            if [ -d .git ]; then
-              git pull
+            set -eu
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -qq nginx git rsync
+
+            if [ ! -d /var/www/axialy ]; then
+              git clone --depth 1 https://github.com/${{ github.repository }} /var/www/axialy
             else
-              git clone https://github.com/Axiamax/axialy-marketing-site .
+              cd /var/www/axialy && git pull
             fi
+            rsync -a --delete /var/www/axialy/axialy.ai/ /var/www/html/
+            systemctl restart nginx
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install DNS dependencies
+        run: pip install requests xmltodict
+
+      - name: Sync DNS A record
+        run: |
+          python scripts/update-dns.py \
+            --api-key "${{ secrets.NAMESILO_API_KEY }}" \
+            --domain "${{ env.NAMESILO_DOMAIN }}" \
+            --ip "${{ needs.terraform.outputs.droplet_ip }}"
