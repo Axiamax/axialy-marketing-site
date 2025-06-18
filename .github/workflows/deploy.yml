@@ -23,6 +23,7 @@ jobs:
         uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: 1.5.0
+          terraform_wrapper: false     # disable wrapper so outputs are clean
 
       - name: Terraform Init
         working-directory: terraform
