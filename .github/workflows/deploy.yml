@@ -67,7 +67,7 @@ jobs:
           host: ${{ needs.provision.outputs.droplet_ip }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          passphrase: ${{ secrets.SSH_PASSPHRASE }}    # required if your key has one
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             apt-get update && apt-get install -y git
             mkdir -p /var/www/html
