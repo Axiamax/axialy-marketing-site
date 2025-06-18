@@ -97,3 +97,4 @@ jobs:
             --api-key "${{ secrets.NAMESILO_API_KEY }}" \
             --domain "${{ env.NAMESILO_DOMAIN }}" \
             --ip "${{ needs.provision.outputs.droplet_ip }}"
+
