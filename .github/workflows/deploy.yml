@@ -1,6 +1,9 @@
 name: Deploy
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
 
 jobs:
@@ -18,19 +21,25 @@ jobs:
           sudo tar -xzvf doctl.tar.gz -C /usr/local/bin doctl
 
       - name: Authenticate doctl
-        run: doctl auth init -t "${{ secrets.DIGITALOCEAN_TOKEN }}"
+        env:
+          DIGITALOCEAN_TOKEN: ${{ secrets.DIGITALOCEAN_TOKEN }}
+        run: doctl auth init -t "$DIGITALOCEAN_TOKEN"
 
       - name: Ensure SSH key is imported
+        env:
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+          SSH_KEY_FINGERPRINT: ${{ secrets.SSH_KEY_FINGERPRINT }}
         run: |
-          echo "${{ secrets.SSH_PUBLIC_KEY }}" > /tmp/deploy_key.pub
-          FP="${{ secrets.SSH_KEY_FINGERPRINT }}"
-          if ! doctl compute ssh-key list --format FingerPrint --no-header | grep -q "$FP"; then
+          echo "$SSH_PUBLIC_KEY" > /tmp/deploy_key.pub
+          if ! doctl compute ssh-key list --format FingerPrint --no-header | grep -q "$SSH_KEY_FINGERPRINT"; then
             doctl compute ssh-key import deploy_key \
               --public-key-file /tmp/deploy_key.pub \
-              --fingerprint "$FP"
+              --fingerprint "$SSH_KEY_FINGERPRINT"
           fi
 
       - name: Ensure droplet exists
+        env:
+          SSH_KEY_FINGERPRINT: ${{ secrets.SSH_KEY_FINGERPRINT }}
         run: |
           NAME="axialy-main"
           if ! doctl compute droplet list --format Name --no-header | grep -xq "$NAME"; then
@@ -38,7 +47,7 @@ jobs:
               --region nyc3 \
               --image ubuntu-24-04-x64 \
               --size s-1vcpu-1gb \
-              --ssh-keys "${{ secrets.SSH_KEY_FINGERPRINT }}" \
+              --ssh-keys "$SSH_KEY_FINGERPRINT" \
               --wait
           fi
 
@@ -64,4 +73,3 @@ jobs:
             else
               git clone https://github.com/Axiamax/axialy-marketing-site .
             fi
-
