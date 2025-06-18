@@ -1,116 +1,111 @@
-name: Provision & Deploy
-
+name: Build & Deploy Axialy-UI to DigitalOcean
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  id-token: write
-
-concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: true
+    branches: [main]          # deploy on every push to main
+  workflow_dispatch:          # …or manual trigger
 
 env:
-  NAMESILO_DOMAIN: axialy.ai
-  TF_VERSION: 1.6.6
-  DO_REGION: nyc3
+  # --- customise here ----------------------------------------------------
+  DROPLET_NAME: axialy-ui
+  DROPLET_REGION: sfo3
+  DROPLET_SIZE: s-1vcpu-1gb
+  DROPLET_IMAGE: ubuntu-22-04-x64
+  SUBDOMAIN: ui               # ui.axialy.ai → change for api/admin repos
+  DOMAIN: axialy.ai
+  SSH_USER: root
+  # ----------------------------------------------------------------------
 
 jobs:
-  terraform:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: terraform
-    outputs:
-      droplet_ip: ${{ steps.output_ip.outputs.droplet_ip }}
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v2
-        with:
-          terraform_version: ${{ env.TF_VERSION }}
-          terraform_wrapper: false
-
-      - name: Terraform Init
-        run: terraform init -input=false
-
-      - name: Terraform Validate
-        run: terraform validate -no-color
-
-      - name: Terraform Plan
-        id: plan
-        run: terraform plan -no-color \
-          -var "do_token=${{ secrets.DO_TOKEN }}" \
-          -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
-
-      - name: Terraform Apply
-        if: github.ref == 'refs/heads/main'
-        run: terraform apply -auto-approve \
-          -var "do_token=${{ secrets.DO_TOKEN }}" \
-          -var "ssh_key_name=${{ secrets.SSH_KEY_NAME }}"
-
-      - name: Capture Droplet IP
-        id: output_ip
-        run: echo "droplet_ip=$(terraform output -raw droplet_ip)" >> "$GITHUB_OUTPUT"
-
   deploy:
-    needs: terraform
     runs-on: ubuntu-latest
-    environment: production
 
     steps:
-      - uses: actions/checkout@v4
+    - name: Check-out repository
+      uses: actions/checkout@v4
 
-      - name: Wait for SSH
-        run: |
-          ip=${{ needs.terraform.outputs.droplet_ip }}
-          echo "Waiting for $ip to be reachable..."
-          for i in {1..24}; do
-            if ssh -o StrictHostKeyChecking=no -i <(echo "${{ secrets.SSH_PRIVATE_KEY }}") root@$ip 'echo ok' &>/dev/null; then
-              echo "Droplet ready."
-              exit 0
-            fi
-            sleep 10
-          done
-          echo "Timed out waiting for droplet." && exit 1
+    - name: Install doctl & authenticate
+      uses: digitalocean/action-doctl@v2
+      with:
+        token: ${{ secrets.DO_TOKEN }}
 
-      - name: Deploy site over SSH
-        uses: appleboy/ssh-action@v1.0.0
-        with:
-          host: ${{ needs.terraform.outputs.droplet_ip }}
-          username: root
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          script: |
-            set -eu
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -qq
-            apt-get install -qq nginx git rsync
+    - name: Ensure droplet exists / create if missing
+      id: droplet
+      shell: bash
+      run: |
+        set -eo pipefail
+        # Look for existing droplet
+        INFO=$(doctl compute droplet list --no-header --format ID,Name,PublicIPv4 | grep -w "$DROPLET_NAME" || true)
+        if [[ -z "$INFO" ]]; then
+          echo "::notice::Droplet not found – creating…"
+          doctl compute droplet create "$DROPLET_NAME" \
+            --size $DROPLET_SIZE \
+            --image $DROPLET_IMAGE \
+            --region $DROPLET_REGION \
+            --ssh-keys ${{ secrets.SSH_FINGERPRINT }} \
+            --tag-name axialy \
+            --wait
+          INFO=$(doctl compute droplet list --no-header --format ID,Name,PublicIPv4 | grep -w "$DROPLET_NAME")
+          CREATED=true
+        else
+          echo "::notice::Droplet already exists – re-using."
+          CREATED=false
+        fi
+        DID=$(echo "$INFO" | awk '{print $1}')
+        DIP=$(echo "$INFO" | awk '{print $3}')
+        echo "id=$DID"      >> $GITHUB_OUTPUT
+        echo "ip=$DIP"      >> $GITHUB_OUTPUT
+        echo "created=$CREATED" >> $GITHUB_OUTPUT
 
-            if [ ! -d /var/www/axialy ]; then
-              git clone --depth 1 https://github.com/${{ github.repository }} /var/www/axialy
-            else
-              cd /var/www/axialy && git pull
-            fi
-            rsync -a --delete /var/www/axialy/axialy.ai/ /var/www/html/
-            systemctl restart nginx
+    - name: Install xmllint (for DNS step)
+      run: sudo apt-get update && sudo apt-get install -y libxml2-utils
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+    - name: Add droplet host key to known_hosts
+      run: |
+        mkdir -p ~/.ssh
+        ssh-keyscan -H ${{ steps.droplet.outputs.ip }} >> ~/.ssh/known_hosts
 
-      - name: Install DNS dependencies
-        run: pip install requests xmltodict
+    - name: Copy source to droplet
+      uses: appleboy/scp-action@v0.1.4
+      with:
+        host: ${{ steps.droplet.outputs.ip }}
+        username: ${{ env.SSH_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        passphrase: ${{ secrets.SSH_PASSPHRASE }}
+        source: "."
+        target: "/var/www/axialy-ui"
+        rm: true                 # removes extraneous files on target
 
-      - name: Sync DNS A record
-        run: |
-          python scripts/update-dns.py \
-            --api-key "${{ secrets.NAMESILO_API_KEY }}" \
-            --domain "${{ env.NAMESILO_DOMAIN }}" \
-            --ip "${{ needs.terraform.outputs.droplet_ip }}"
+    - name: Remote post-deploy commands
+      uses: appleboy/ssh-action@v1.0.3
+      with:
+        host: ${{ steps.droplet.outputs.ip }}
+        username: ${{ env.SSH_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        passphrase: ${{ secrets.SSH_PASSPHRASE }}
+        script: |
+          set -e
+          apt-get update -y
+          apt-get install -y apache2
+          systemctl enable apache2
+          systemctl restart apache2
+          echo "Axialy-UI deployed via GitHub Actions on $(date)" > /var/www/axialy-ui/DEPLOY_INFO.txt
+
+    - name: Sync DNS at NameSilo (only if droplet was NEW)
+      if: ${{ steps.droplet.outputs.created == 'true' }}
+      shell: bash
+      env:
+        API_KEY: ${{ secrets.NAMESILO_API_KEY }}
+      run: |
+        set -eo pipefail
+        HOST=$SUBDOMAIN
+        IP=${{ steps.droplet.outputs.ip }}
+        # get record-id if it exists
+        RECORDS=$(curl -s "https://www.namesilo.com/api/dns/listRecords?version=1&type=xml&key=$API_KEY&domain=$DOMAIN")
+        RRID=$(echo "$RECORDS" | xmllint --xpath "string(//resource_record[host='$HOST.$DOMAIN']/record_id)" - 2>/dev/null || true)
+        if [[ -z "$RRID" ]]; then
+          echo "::notice::Creating new A-record for $HOST.$DOMAIN → $IP"
+          curl -s "https://www.namesilo.com/api/dns/addRecord?version=1&type=A&key=$API_KEY&domain=$DOMAIN&rrhost=$HOST&rrvalue=$IP&rrttl=3600" >/dev/null
+        else
+          echo "::notice::Updating existing A-record $RRID → $IP"
+          curl -s "https://www.namesilo.com/api/dns/updateRecord?version=1&type=A&key=$API_KEY&domain=$DOMAIN&rrid=$RRID&rrhost=$HOST&rrvalue=$IP&rrttl=3600" >/dev/null
+        fi
