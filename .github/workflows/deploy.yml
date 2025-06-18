@@ -2,16 +2,18 @@ name: Full Deploy
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 env:
+  # your domain isn’t a secret
   NAMESILO_DOMAIN: axialy.ai
 
 jobs:
   provision:
     runs-on: ubuntu-latest
     outputs:
-      droplet_ip: ${{ steps.output_ip.outputs.ip }}
+      droplet_ip: ${{ steps.output_ip.outputs.droplet_ip }}
 
     steps:
       - name: Checkout repo
@@ -37,7 +39,8 @@ jobs:
         id: output_ip
         working-directory: terraform
         run: |
-          echo "ip=$(terraform output -raw droplet_ip)" >> "$GITHUB_OUTPUT"
+          IP=$(terraform output -raw droplet_ip)
+          echo "droplet_ip=$IP" >> $GITHUB_OUTPUT
 
   deploy:
     needs: provision
@@ -53,7 +56,7 @@ jobs:
           host: ${{ needs.provision.outputs.droplet_ip }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # If your key is passphrase-protected, also add:
+          # If your private key is passphrase-protected, also add:
           # passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             mkdir -p /var/www/html
@@ -75,7 +78,7 @@ jobs:
       - name: Debug DNS inputs
         run: |
           echo "⟳ NAMESILO_DOMAIN=${NAMESILO_DOMAIN}"
-          echo "⟳ TARGET IP    =${{ needs.provision.outputs.droplet_ip }}"
+          echo "⟳ TARGET_IP=${{ needs.provision.outputs.droplet_ip }}"
 
       - name: Update DNS records
         run: |
