@@ -1,100 +1,69 @@
-name: CI ▶️ DigitalOcean
+name: Deploy
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      DO_TOKEN: ${{ secrets.DO_TOKEN     }} # Personal Access Token with write rights
-      SSH_KEY:  ${{ secrets.SSH_PUBLIC    }} # The public half of your deploy key
-      SSH_PRIV: ${{ secrets.SSH_PRIVATE   }} # The private half, optional if you use DO’s “apps” feature
-      SSH_PASS: ${{ secrets.SSH_PASSPHRASE }} # If your private key is passphrase-protected
-      DROPLET:  axialy-main
-      REGION:   nyc3
-      IMAGE:    ubuntu-24-04-x64
-      SIZE:     s-1vcpu-1gb
+      # Droplet settings
+      DROPLET: axialy-main
+      REGION: nyc3
+      IMAGE: ubuntu-24-04-x64
+      SIZE: s-1vcpu-1gb
 
     steps:
-      - name: Check out code
+      - name: Checkout code
         uses: actions/checkout@v3
 
       - name: Install doctl
         run: |
-          curl -sL https://github.com/digitalocean/doctl/releases/latest/download/doctl-$(uname)-amd64.tar.gz \
+          curl -sL "https://github.com/digitalocean/doctl/releases/latest/download/doctl-$(uname | tr '[:upper:]' '[:lower:]')-amd64.tar.gz" \
             | tar -xzC /usr/local/bin doctl
           doctl version
 
-      - name: Authenticate doctl
-        run: doctl auth init --access-token $DO_TOKEN
-
-      - name: Ensure SSH key is registered
-        id: sshkey
+      - name: Provision (or fetch) Droplet
+        id: provision
         run: |
-          # Try to find it by fingerprint; if not found, add it:
-          FINGERPRINT=$(ssh-keygen -lf <(echo "$SSH_KEY") | awk '{print $2}')
-          if doctl compute ssh-key list --format Name,Fingerprint \
-              | grep -q "$FINGERPRINT"; then
-            echo "Key already registered."
-          else
-            echo "Registering new key…"
-            doctl compute ssh-key create \
-              --public-key "$SSH_KEY" \
-              --name "deploy-key-${{ github.run_id }}"
+          # Authenticate with DO_TOKEN secret
+          doctl auth init -t "${{ secrets.DO_TOKEN }}"
+
+          # Import your SSH public key (idempotent)
+          ssh-keygen -y -f <(echo "${{ secrets.SSH_PRIVATE_KEY }}") | \
+            doctl compute ssh-key import deploy_key \
+              --public-key - \
+              --fingerprint "${{ secrets.SSH_FINGERPRINT }}" || true
+
+          # Create droplet if it doesn't exist
+          if ! doctl compute droplet get "$DROPLET" >/dev/null 2>&1; then
+            doctl compute droplet create "$DROPLET" \
+              --region "$REGION" \
+              --image "$IMAGE" \
+              --size "$SIZE" \
+              --ssh-keys "${{ secrets.SSH_FINGERPRINT }}" \
+              --wait
           fi
 
-      - name: Check for existing Droplet
-        id: droplet-check
-        run: |
-          if doctl compute droplet list --format Name --no-header \
-              | grep -xq "$DROPLET"; then
-            echo "::set-output name=exists::yes"
-          else
-            echo "::set-output name=exists::no"
-          fi
+          # Grab its public IP
+          IP=$(doctl compute droplet get "$DROPLET" --format PublicIPv4 --no-header)
+          echo "ip=$IP" >> $GITHUB_OUTPUT
 
-      - name: Create Droplet if missing
-        if: steps.droplet-check.outputs.exists == 'no'
-        run: |
-          # grab all your key IDs so the new Droplet can ssh in later
-          KEY_IDS=$(doctl compute ssh-key list --format ID --no-header | paste -sd, -)
-          doctl compute droplet create $DROPLET \
-            --region $REGION \
-            --image  $IMAGE \
-            --size   $SIZE \
-            --ssh-keys $KEY_IDS \
-            --wait
-          echo "Droplet created."
-
-      - name: Get Droplet IP
-        id: get-ip
-        run: |
-          IP=$(doctl compute droplet list \
-            --format Name,PublicIPv4 --no-header \
-            | awk -v name="$DROPLET" '$1==name {print $2}')
-          echo "::set-output name=ip::$IP"
-
-      - name: Wait for SSH to be ready
-        run: |
-          for i in {1..12}; do
-            nc -zv ${{ steps.get-ip.outputs.ip }} 22 && break
-            sleep 5
-          done
-
-      - name: Deploy over SSH
+      - name: Deploy via SSH
         uses: appleboy/ssh-action@v0.1.7
         with:
-          host: ${{ steps.get-ip.outputs.ip }}
+          host: ${{ steps.provision.outputs.ip }}
           username: root
-          key: ${{ secrets.SSH_PRIVATE }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
           passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
+            apt-get update && apt-get install -y git
+            mkdir -p /var/www/html
             cd /var/www/html
             if [ -d .git ]; then
               git pull
             else
-              git clone https://github.com/${{ github.repository }} .
+              git clone https://github.com/Axiamax/axialy-marketing-site .
             fi
-
