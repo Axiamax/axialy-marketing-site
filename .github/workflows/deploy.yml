@@ -2,30 +2,24 @@ name: Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
   deploy:
     runs-on: ubuntu-24.04
     env:
       DROPLET: axialy-main
-      REGION: nyc3
-      IMAGE: ubuntu-24-04-x64
-      SIZE: s-1vcpu-1gb
+      REGION:  nyc3
+      IMAGE:   ubuntu-24-04-x64
+      SIZE:    s-1vcpu-1gb
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Install doctl
-        run: |
-          curl -sSL https://github.com/digitalocean/doctl/releases/latest/download/doctl-linux-amd64.tar.gz \
-            | sudo tar -C /usr/local/bin -xz
-          doctl version
-
-      - name: Authenticate to DigitalOcean
-        run: doctl auth init -t "${{ secrets.DO_TOKEN }}"
+      - name: Setup doctl
+        uses: digitalocean/action-doctl@v2
+        with:
+          token: ${{ secrets.DO_TOKEN }}
 
       - name: Ensure SSH key is imported
         run: |
@@ -55,10 +49,10 @@ jobs:
       - name: Deploy via SSH
         uses: appleboy/ssh-action@v0.1.7
         with:
-          host: ${{ steps.provision.outputs.ip }}
-          username: root
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          host:        ${{ steps.provision.outputs.ip }}
+          username:    root
+          key:         ${{ secrets.SSH_PRIVATE_KEY }}
+          passphrase:  ${{ secrets.SSH_PASSPHRASE }}
           script: |
             apt-get update && apt-get install -y git
             mkdir -p /var/www/html
