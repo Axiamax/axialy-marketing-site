@@ -23,25 +23,30 @@ jobs:
         SSH_PUB: ${{ secrets.SSH_PUBLIC_KEY }}
         SSH_FP:  ${{ secrets.SSH_FINGERPRINT }}
       run: |
-        # Try to import your public key (idempotent)
-        echo "$SSH_PUB" \
-          | doctl compute ssh-key import deploy_key \
-              --public-key - \
-              --fingerprint "$SSH_FP" \
-          && echo "Imported" \
-          || echo "Already exists"
+        # dump public key to a file
+        echo "$SSH_PUB" > /tmp/deploy_key.pub
+
+        # import only if fingerprint missing
+        if ! doctl compute ssh-key list --format FingerPrint --no-header \
+             | grep -q "$SSH_FP"; then
+          doctl compute ssh-key import deploy_key \
+            --public-key-file /tmp/deploy_key.pub \
+            --fingerprint "$SSH_FP"
+        else
+          echo "SSH key already present"
+        fi
 
     - name: Create droplet if missing
       env:
-        SSH_FP:   ${{ secrets.SSH_FINGERPRINT }}
-        REGION:   nyc3
-        IMAGE:    ubuntu-24-04-x64
-        SIZE:     s-1vcpu-1gb
-        DROPLET:  axialy-main
+        SSH_FP:  ${{ secrets.SSH_FINGERPRINT }}
+        REGION:  nyc3
+        IMAGE:   ubuntu-24-04-x64
+        SIZE:    s-1vcpu-1gb
+        NAME:    axialy-main
       run: |
         if ! doctl compute droplet list --format Name --no-header \
-             | grep -xq "$DROPLET"; then
-          doctl compute droplet create "$DROPLET" \
+             | grep -xq "$NAME"; then
+          doctl compute droplet create "$NAME" \
             --region "$REGION" \
             --image  "$IMAGE"  \
             --size   "$SIZE"   \
@@ -49,10 +54,17 @@ jobs:
             --wait
         fi
 
+    - name: Get Droplet IP
+      id: get_ip
+      run: |
+        IP=$(doctl compute droplet list axialy-main \
+             --format PublicIPv4 --no-header | head -n1)
+        echo "ip=$IP" >> $GITHUB_OUTPUT
+
     - name: Deploy via SSH
       uses: appleboy/ssh-action@v0.1.7
       with:
-        host:       ${{ secrets.DROPLET_IP }}           # or use a doctl lookup step
+        host:       ${{ steps.get_ip.outputs.ip }}
         username:   root
         key:        ${{ secrets.SSH_PRIVATE_KEY }}
         passphrase: ${{ secrets.SSH_PASSPHRASE }}
