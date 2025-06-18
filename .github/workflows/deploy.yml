@@ -5,7 +5,6 @@ on:
     branches: [ main ]
 
 env:
-  # your domain is not a secret
   NAMESILO_DOMAIN: axialy.ai
 
 jobs:
@@ -37,7 +36,8 @@ jobs:
       - name: Capture Droplet IP
         id: output_ip
         working-directory: terraform
-        run: echo "::set-output name=ip::$(terraform output -raw droplet_ip)"
+        run: |
+          echo "ip=$(terraform output -raw droplet_ip)" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: provision
@@ -53,6 +53,8 @@ jobs:
           host: ${{ needs.provision.outputs.droplet_ip }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          # If your key is passphrase-protected, also add:
+          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
           script: |
             mkdir -p /var/www/html
             cd /var/www/html
@@ -69,6 +71,11 @@ jobs:
 
       - name: Install DNS script deps
         run: pip install requests xmltodict
+
+      - name: Debug DNS inputs
+        run: |
+          echo "⟳ NAMESILO_DOMAIN=${NAMESILO_DOMAIN}"
+          echo "⟳ TARGET IP    =${{ needs.provision.outputs.droplet_ip }}"
 
       - name: Update DNS records
         run: |
