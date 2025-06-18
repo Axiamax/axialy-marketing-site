@@ -2,11 +2,9 @@ name: Full Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 env:
-  # your domain isn’t a secret
   NAMESILO_DOMAIN: axialy.ai
 
 jobs:
@@ -23,7 +21,7 @@ jobs:
         uses: hashicorp/setup-terraform@v2
         with:
           terraform_version: 1.5.0
-          terraform_wrapper: false     # disable wrapper so outputs are clean
+          terraform_wrapper: false
 
       - name: Terraform Init
         working-directory: terraform
@@ -51,15 +49,27 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v3
 
+      - name: Wait for SSH
+        run: |
+          echo "🔄 Waiting for SSH to be ready on ${{ needs.provision.outputs.droplet_ip }}…"
+          for i in {1..12}; do
+            if nc -z ${{ needs.provision.outputs.droplet_ip }} 22; then
+              echo "✅ SSH is up!"
+              break
+            fi
+            echo "…retry in 5s"
+            sleep 5
+          done
+
       - name: Deploy over SSH
         uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ needs.provision.outputs.droplet_ip }}
           username: root
           key: ${{ secrets.SSH_PRIVATE_KEY }}
-          # If your private key is passphrase-protected, also add:
-          # passphrase: ${{ secrets.SSH_PASSPHRASE }}
+          passphrase: ${{ secrets.SSH_PASSPHRASE }}    # required if your key has one
           script: |
+            apt-get update && apt-get install -y git
             mkdir -p /var/www/html
             cd /var/www/html
             if [ -d .git ]; then
