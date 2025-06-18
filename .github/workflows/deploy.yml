@@ -7,9 +7,8 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     env:
-      # droplet specs (you can tweak these directly here)
       DROPLET: axialy-main
       REGION: nyc3
       IMAGE: ubuntu-24-04-x64
@@ -19,11 +18,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Install doctl (DigitalOcean CLI)
+      - name: Install doctl
         run: |
-          # we know this is running on Ubuntu runners => linux
-          curl -sL https://github.com/digitalocean/doctl/releases/latest/download/doctl-linux-amd64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin doctl
+          curl -sSL https://github.com/digitalocean/doctl/releases/latest/download/doctl-linux-amd64.tar.gz \
+            | sudo tar -C /usr/local/bin -xz
           doctl version
 
       - name: Authenticate to DigitalOcean
@@ -31,20 +29,18 @@ jobs:
 
       - name: Ensure SSH key is imported
         run: |
-          # derive the public key from your private key secret
           PUB=$(echo "${{ secrets.SSH_PRIVATE_KEY }}" | ssh-keygen -y -f -)
-          # import if missing (or skip if fingerprint already exists)
           if ! doctl compute ssh-key list --format Fingerprint --no-header \
                | grep -q "${{ secrets.SSH_FINGERPRINT }}"; then
-            echo "$PUB" | doctl compute ssh-key import deploy_key \
-              --public-key - \
-              --fingerprint "${{ secrets.SSH_FINGERPRINT }}"
+            echo "$PUB" \
+              | doctl compute ssh-key import deploy_key \
+                --public-key - \
+                --fingerprint "${{ secrets.SSH_FINGERPRINT }}"
           fi
 
       - name: Create or fetch Droplet
         id: provision
         run: |
-          # only create if it doesn't exist
           if ! doctl compute droplet get "$DROPLET" >/dev/null 2>&1; then
             doctl compute droplet create "$DROPLET" \
               --region "$REGION" \
@@ -53,7 +49,6 @@ jobs:
               --ssh-keys "${{ secrets.SSH_FINGERPRINT }}" \
               --wait
           fi
-          # pull its IP
           IP=$(doctl compute droplet get "$DROPLET" --format PublicIPv4 --no-header)
           echo "ip=$IP" >> $GITHUB_OUTPUT
 
