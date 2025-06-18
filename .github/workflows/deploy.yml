@@ -1,4 +1,4 @@
-name: Deploy
+name: Deploy to DigitalOcean
 
 on:
   push:
@@ -7,65 +7,63 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+    - name: Checkout code
+      uses: actions/checkout@v3
 
-      - name: Install doctl
-        run: |
-          curl -sSL https://github.com/digitalocean/doctl/releases/latest/download/doctl-linux-amd64.tar.gz \
-            | sudo tar -xz -C /usr/local/bin doctl
-          doctl version
+    - name: Install & authenticate doctl
+      uses: digitalocean/action-doctl@v2
+      with:
+        token: ${{ secrets.DO_TOKEN }}
+        version: latest
 
-      - name: Authenticate doctl
-        env:
-          DIGITALOCEAN_TOKEN: ${{ secrets.DO_TOKEN }}
-        run: |
-          doctl auth init -t "$DIGITALOCEAN_TOKEN"
-          doctl auth switch default
+    - name: Ensure SSH key is imported
+      env:
+        SSH_PUB: ${{ secrets.SSH_PUBLIC_KEY }}
+        SSH_FP:  ${{ secrets.SSH_FINGERPRINT }}
+      run: |
+        # Try to import your public key (idempotent)
+        echo "$SSH_PUB" \
+          | doctl compute ssh-key import deploy_key \
+              --public-key - \
+              --fingerprint "$SSH_FP" \
+          && echo "Imported" \
+          || echo "Already exists"
 
-      - name: Import SSH key to DigitalOcean
-        env:
-          SSH_PUB: ${{ secrets.SSH_PUBLIC_KEY }}      # contents of deploy_key.pub
-          SSH_FP: ${{ secrets.SSH_FINGERPRINT }}     # fingerprint e.g. ca:06:…
-        run: |
-          echo "$SSH_PUB" \
-            | doctl compute ssh-key import deploy_key \
-                --public-key - \
-                --fingerprint "$SSH_FP" \
-            || echo "SSH key already exists"
+    - name: Create droplet if missing
+      env:
+        SSH_FP:   ${{ secrets.SSH_FINGERPRINT }}
+        REGION:   nyc3
+        IMAGE:    ubuntu-24-04-x64
+        SIZE:     s-1vcpu-1gb
+        DROPLET:  axialy-main
+      run: |
+        if ! doctl compute droplet list --format Name --no-header \
+             | grep -xq "$DROPLET"; then
+          doctl compute droplet create "$DROPLET" \
+            --region "$REGION" \
+            --image  "$IMAGE"  \
+            --size   "$SIZE"   \
+            --ssh-keys "$SSH_FP" \
+            --wait
+        fi
 
-      - name: Provision or update Droplet
-        env:
-          DO_TOKEN: ${{ secrets.DO_TOKEN }}
-          SSH_FP:   ${{ secrets.SSH_FINGERPRINT }}
-          REGION:   nyc3
-          IMAGE:    ubuntu-24-04-x64
-          SIZE:     s-1vcpu-1gb
-          DROPLET:  axialy-main
-        run: |
-          # create if missing
-          if ! doctl compute droplet list --format Name --no-header \
-               | grep -xq "$DROPLET"; then
-            doctl compute droplet create "$DROPLET" \
-              --region "$REGION" --image "$IMAGE" --size "$SIZE" \
-              --ssh-keys "$SSH_FP" --wait
+    - name: Deploy via SSH
+      uses: appleboy/ssh-action@v0.1.7
+      with:
+        host:       ${{ secrets.DROPLET_IP }}           # or use a doctl lookup step
+        username:   root
+        key:        ${{ secrets.SSH_PRIVATE_KEY }}
+        passphrase: ${{ secrets.SSH_PASSPHRASE }}
+        script: |
+          set -e
+          apt-get update
+          apt-get install -y git
+          mkdir -p /var/www/html
+          cd /var/www/html
+          if [ -d .git ]; then
+            git pull
+          else
+            git clone https://github.com/Axiamax/axialy-marketing-site .
           fi
-
-      - name: Deploy code via SSH
-        uses: appleboy/ssh-action@v0.1.7
-        with:
-          host: ${{ steps.provision.outputs.ip }}
-          username: root
-          key: ${{ secrets.SSH_PRIVATE_KEY }}
-          passphrase: ${{ secrets.SSH_PASSPHRASE }}
-          script: |
-            set -e
-            apt-get update && apt-get install -y git
-            mkdir -p /var/www/html
-            cd /var/www/html
-            if [ -d .git ]; then
-              git pull
-            else
-              git clone https://github.com/Axiamax/axialy-marketing-site .
-            fi
